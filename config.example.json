@@ -1,0 +1,36 @@
+{
+  "architectures": [
+    "TalkieForCausalLM"
+  ],
+  "dtype": "bfloat16",
+  "eos_token_id": [
+    65535,
+    65536,
+    65537,
+    65539
+  ],
+  "head_dim": 128,
+  "max_seq_len": 4096,
+  "mlx_runtime": "mlx_talkie",
+  "model_type": "talkie",
+  "n_embd": 5120,
+  "n_head": 40,
+  "n_layer": 40,
+  "rope_base": 1000000.0,
+  "source_checkpoint": "rl-refined.pt",
+  "source_repo": "talkie-lm/talkie-1930-13b-it",
+  "style": "it",
+  "vocab_size": 65540,
+  "quantization": {
+    "group_size": 64,
+    "bits": 8,
+    "mode": "affine"
+  },
+  "quantization_config": {
+    "group_size": 64,
+    "bits": 8,
+    "mode": "affine"
+  },
+  "original_max_seq_len": 2048,
+  "notes": "Trained at 2048. 4096 works reliably. Beyond 4K quality degrades (tested up to 64K). Memory available for 16K+ with 8-bit quant."
+}
