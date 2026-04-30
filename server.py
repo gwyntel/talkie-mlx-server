@@ -276,8 +276,8 @@ def main():
     parser = argparse.ArgumentParser(description="Talkie 8-bit OpenAI-compatible server")
     parser.add_argument(
         "--model-dir",
-        default="./models/talkie-1930-13b-it-mlx-8bit",
-        help="Path to the Talkie MLX model directory",
+        default=".",
+        help="Path to the Talkie MLX model directory (default: current directory)",
     )
     parser.add_argument("--model-id", default="talkie-1930-13b-it-mlx-8bit",
                         help="Model identifier returned by the API")

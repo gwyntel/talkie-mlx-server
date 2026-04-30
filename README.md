@@ -75,7 +75,7 @@ print('Done!')
 ### Starting the server
 
 ```bash
-python server.py --port 8080 --host 127.0.0.1
+python server.py --model-dir ~/.omlx/models/talkie-1930-13b-it-mlx-8bit --port 8080 --host 127.0.0.1
 ```
 
 The model loads at startup (~5s for 8-bit). Memory usage at idle: ~15 GB.
@@ -182,6 +182,35 @@ This is why `mlx_lm server` doesn't work out of the box -- it expects standard H
 - **4-bit quantization broken**: The `sanitize()` method in the PR branch can't handle `.scales`/`.biases` weight names. Use 8-bit instead.
 - **oMLX unsupported**: oMLX's model registry doesn't recognize `model_type: "talkie"`. Use mlx-lm directly.
 - **`mlx_lm server` hangs**: The bundled `mlx_talkie/model.py` uses raw `matmul` which crashes on quantized weights. This server uses `mlx_lm.load()` with `QuantizedLinear` auto-conversion instead.
+
+## Running as a Persistent Service (macOS launchd)
+
+For long-running Discord bot use, you want the server and llmcord to stay up
+permanently — auto-start on login and auto-restart on crash. Use macOS launchd.
+
+See the [complete setup guide in DISCORD_GUIDE.md](DISCORD_GUIDE.md#making-it-persistent-launchd)
+for the plist files and instructions.
+
+Quick start:
+
+```bash
+# Kill any manually-started instances
+pkill -f "server.py --model-dir"
+pkill -f "llmcord.py"
+
+# Load the launchd services (plist files must be created first - see guide)
+launchctl load ~/Library/LaunchAgents/com.gwyntel.talkie-server.plist
+launchctl load ~/Library/LaunchAgents/com.gwyntel.llmcord.plist
+
+# Check status
+launchctl list | grep gwyntel
+```
+
+## Discord Bot Setup
+
+For the full guide to connecting Talkie to Discord via llmcord (including
+system prompts, launchd persistence, context tuning, and troubleshooting),
+see [DISCORD_GUIDE.md](DISCORD_GUIDE.md).
 
 ## Credits
 
