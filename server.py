@@ -18,6 +18,13 @@ Usage:
 DEBUG LOGGING:
     Set LOG_LEVEL=DEBUG env var or --log-level flag for verbose request/response logging.
     Logs to stderr by default; redirect to file via your launcher (launchd, systemd, etc).
+
+TRACE LOGGING (for dataset building):
+    Set --trace-dir flag or TRACE_DIR env var to a directory path. Each generation
+    will append a JSONL record with full request/response data to a date-stamped file:
+        <trace-dir>/traces-2026-05-01.jsonl
+    Records include: messages, rendered prompt, output, token counts, generation params,
+    and latency. No performance impact when disabled (default).
 """
 
 from __future__ import annotations
@@ -57,6 +64,7 @@ _model = None
 _tokenizer = None
 _model_dir = None
 _model_id = "talkie-1930-13b-it-mlx-8bit"
+_trace_dir = None  # set via --trace-dir or TRACE_DIR env
 
 MAX_TOKENS_DEFAULT=1024
 TEMPERATURE_DEFAULT = 0.7
@@ -70,6 +78,48 @@ TOP_P_DEFAULT = 0.95
 _EOS_IDS = {65535, 65536, 65537, 65539}
 _EOS_BIAS = -100.0
 _MIN_RESPONSE_TOKENS=80
+
+
+# ---------------------------------------------------------------------------
+# Trace logging — write full request/response pairs to JSONL for dataset
+# building.  Enabled via --trace-dir flag or TRACE_DIR env var.
+# Each request appends one JSON line to a date-stamped file:
+#   <trace-dir>/traces-2026-05-01.jsonl
+# ---------------------------------------------------------------------------
+def _write_trace(*, req_id: str, messages: list, prompt: str, output: str,
+                 prompt_tokens: int, completion_tokens: int,
+                 max_tokens: int, temperature: float, top_p: float,
+                 latency_ms: float, stream: bool) -> None:
+    """Append a trace record to the trace log. No-op if _trace_dir is None."""
+    if _trace_dir is None:
+        return
+    try:
+        record = {
+            "id": req_id,
+            "timestamp": datetime.now().isoformat(),
+            "messages": messages,
+            "prompt_rendered": prompt,
+            "output": output,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "generation_params": {
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "stream": stream,
+            },
+            "latency_ms": round(latency_ms, 1),
+        }
+        # Date-stamped file for easy rotation
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        trace_file = Path(_trace_dir) / f"traces-{date_str}.jsonl"
+        trace_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(trace_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        logger.debug(f"[TRACE] wrote trace record req_id={req_id}")
+    except Exception:
+        # Trace failures must never break generation
+        logger.exception(f"[TRACE] failed to write trace for req_id={req_id}")
 
 
 def _make_eos_processor():
@@ -91,26 +141,35 @@ def _make_eos_processor():
 
 
 def _generate_with_eos_suppress(prompt: str, max_tokens: int,
-                                 temperature: float, top_p: float) -> str:
+                                 temperature: float, top_p: float) -> dict:
     """Generate with EOS suppression via logits_processors.
 
     Uses mlx_lm.generate() which handles prefix-caching, KV cache,
     and speculative decoding correctly — unlike a hand-rolled loop.
+
+    Returns dict with keys: text, prompt_tokens, completion_tokens, latency_ms.
     """
     sampler = make_sampler(temp=temperature, top_p=top_p)
     processor = _make_eos_processor()
+    prompt_tokens = len(_tokenizer.encode(prompt))
     t0 = time.perf_counter()
     result = generate(_model, _tokenizer, prompt=prompt, max_tokens=max_tokens,
                       sampler=sampler, logits_processors=[processor], verbose=False)
     elapsed = time.perf_counter() - t0
     gen_len = len(result)
+    completion_tokens = len(_tokenizer.encode(result))
     logger.info(
         f"[GENERATE] {elapsed:.2f}s, {gen_len} chars, "
         f"max_tokens={max_tokens}, temp={temperature}, top_p={top_p}, "
         f"prompt[:80]={repr(prompt[:80])}"
     )
     REQUEST_LOG.debug(f"[GENERATE] full_output={repr(result)}")
-    return result
+    return {
+        "text": result,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "latency_ms": elapsed * 1000,
+    }
 
 
 def _generate_tokens(prompt: str, max_tokens: int, temperature: float, top_p: float):
@@ -119,7 +178,8 @@ def _generate_tokens(prompt: str, max_tokens: int, temperature: float, top_p: fl
     Yields strings (words or \n) that should be concatenated to reconstruct
     the original generated text character-for-character.
     """
-    text = _generate_with_eos_suppress(prompt, max_tokens, temperature, top_p)
+    gen = _generate_with_eos_suppress(prompt, max_tokens, temperature, top_p)
+    text = gen["text"]
     logger.info(f"[STREAM] generated {len(text)} chars, will yield ~{text.count(' ') + text.count(chr(10))} chunks")
 
     # Split preserving newlines so Discord sees paragraph breaks too
@@ -138,8 +198,11 @@ def _generate_tokens(prompt: str, max_tokens: int, temperature: float, top_p: fl
         yield part
 
 
-def _generate_full(prompt: str, max_tokens: int, temperature: float, top_p: float) -> str:
-    """Generate full response (non-streaming) with EOS suppression."""
+def _generate_full(prompt: str, max_tokens: int, temperature: float, top_p: float) -> dict:
+    """Generate full response (non-streaming) with EOS suppression.
+
+    Returns the full generation result dict from _generate_with_eos_suppress.
+    """
     return _generate_with_eos_suppress(prompt, max_tokens, temperature, top_p)
 
 
@@ -179,7 +242,8 @@ def _chat_completion_stream(body: dict):
     )
 
     try:
-        full_text = _generate_with_eos_suppress(prompt, max_tokens, temperature, top_p)
+        gen = _generate_with_eos_suppress(prompt, max_tokens, temperature, top_p)
+        full_text = gen["text"]
     except Exception:
         logger.exception(f"[CHAT_STREAM] req_id={req_id} generation FAILED")
         REQUEST_LOG.error(f"[CHAT_STREAM] req_id={req_id} generation FAILED: {traceback.format_exc()}")
@@ -190,6 +254,14 @@ def _chat_completion_stream(body: dict):
         f"output_len={len(full_text)} output[:120]={repr(full_text[:120])}"
     )
     REQUEST_LOG.debug(f"[CHAT_STREAM] req_id={req_id} FULL_OUTPUT={repr(full_text)}")
+
+    # Write trace record
+    _write_trace(
+        req_id=req_id, messages=messages_raw, prompt=prompt, output=full_text,
+        prompt_tokens=gen["prompt_tokens"], completion_tokens=gen["completion_tokens"],
+        max_tokens=max_tokens, temperature=temperature, top_p=top_p,
+        latency_ms=gen["latency_ms"], stream=True,
+    )
 
     # Stream word-by-word
     parts = []
@@ -258,7 +330,8 @@ def _chat_completion(body: dict) -> dict:
     )
 
     try:
-        text = _generate_full(prompt, max_tokens, temperature, top_p)
+        gen = _generate_full(prompt, max_tokens, temperature, top_p)
+        text = gen["text"]
     except Exception:
         logger.exception(f"[CHAT] req_id={req_id} generation FAILED")
         raise
@@ -268,6 +341,14 @@ def _chat_completion(body: dict) -> dict:
         f"output[:200]={repr(text[:200])}"
     )
     REQUEST_LOG.debug(f"[CHAT] req_id={req_id} FULL_OUTPUT={repr(text)}")
+
+    # Write trace record
+    _write_trace(
+        req_id=req_id, messages=messages_raw, prompt=prompt, output=text,
+        prompt_tokens=gen["prompt_tokens"], completion_tokens=gen["completion_tokens"],
+        max_tokens=max_tokens, temperature=temperature, top_p=top_p,
+        latency_ms=gen["latency_ms"], stream=False,
+    )
 
     return {
         "id": req_id,
@@ -474,6 +555,9 @@ def main():
     parser.add_argument("--log-level", choices=["DEBUG","INFO","WARNING","ERROR"],
                         default=os.environ.get("LOG_LEVEL", "INFO").upper(),
                         help="Logging level (also set via LOG_LEVEL env var)")
+    parser.add_argument("--trace-dir", default=os.environ.get("TRACE_DIR", ""),
+                        help="Directory to write trace JSONL files for dataset building "
+                             "(also set via TRACE_DIR env var). Disabled by default.")
     args = parser.parse_args()
 
     # Reconfigure logging level if flag differs from env
@@ -483,6 +567,14 @@ def main():
 
     _model_dir = str(Path(args.model_dir).resolve())
     _model_id = args.model_id
+
+    # Configure trace directory
+    if args.trace_dir:
+        _trace_dir = str(Path(args.trace_dir).resolve())
+        Path(_trace_dir).mkdir(parents=True, exist_ok=True)
+        logger.info(f"Trace logging: ENABLED → {_trace_dir}/")
+    else:
+        logger.info("Trace logging: disabled (enable with --trace-dir or TRACE_DIR env var)")
 
     logger.info(f"Loading model from {_model_dir} ...")
     logger.info(f"Log level: {args.log_level}")
