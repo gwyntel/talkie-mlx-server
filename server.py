@@ -50,30 +50,78 @@ def _make_id(prefix="chatcmpl") -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
 
 
-def _generate_tokens(prompt: str, max_tokens: int, temperature: float, top_p: float):
-    """Generate tokens one at a time for streaming.
+# ---------------------------------------------------------------------------
+# EOS suppression: Talkie IT tends to emit <|end|> (token 65536) after just
+# 1-2 sentences, truncating responses. We bias down EOS logits for the first
+# MIN_RESPONSE_TOKENS tokens so the model naturally writes longer replies.
+# ---------------------------------------------------------------------------
+_EOS_IDS = {65535, 65536, 65537, 65539}
+_EOS_BIAS = -100.0
+_MIN_RESPONSE_TOKENS = 80
 
-    Note: True token-by-token streaming from mlx_lm with the Talkie custom
-    model is complex. We use "batch-then-stream": generate the full response
-    first, then yield it word-by-word as SSE chunks. This gives the UX of
-    streaming (typing indicator in Discord, progressive text) while keeping
-    the implementation simple. Total latency is the same since generation
-    must complete before any text can be sent regardless.
+
+def _make_eos_processor():
+    """Return a logits processor that suppresses EOS tokens for the first
+    _MIN_RESPONSE_TOKENS generated tokens. Uses a closure to track count.
+    """
+    count = [0]  # mutable via closure
+
+    def processor(tokens: mx.array, logits: mx.array) -> mx.array:
+        count[0] += 1
+        if count[0] <= _MIN_RESPONSE_TOKENS:
+            for eos_id in _EOS_IDS:
+                logits[eos_id] = logits[eos_id] + _EOS_BIAS
+        return logits
+
+    return processor
+
+
+def _generate_with_eos_suppress(prompt: str, max_tokens: int,
+                                 temperature: float, top_p: float) -> str:
+    """Generate with EOS suppression via logits_processors.
+
+    Talkie IT emits <|end|> prematurely (after 10-20 tokens of output),
+    producing very short 1-2 sentence responses. By biasing the EOS token
+    logits down by -100 for the first 80 tokens, the model naturally produces
+    multi-sentence, multi-paragraph Edwardian prose.
     """
     sampler = make_sampler(temp=temperature, top_p=top_p)
-    text = generate(_model, _tokenizer, prompt=prompt, max_tokens=max_tokens,
-                    sampler=sampler, verbose=False)
-    words = text.split(' ')
-    for i, word in enumerate(words):
-        token = word if i == 0 else ' ' + word
-        yield token
+    processor = _make_eos_processor()
+    return generate(_model, _tokenizer, prompt=prompt, max_tokens=max_tokens,
+                    sampler=sampler, logits_processors=[processor], verbose=False)
+
+
+def _generate_tokens(prompt: str, max_tokens: int, temperature: float, top_p: float):
+    """Generate full response, then yield it word-by-word for SSE streaming.
+
+    Uses EOS suppression to get longer responses from Talkie IT.
+    Newlines are preserved by splitting on word boundaries while keeping
+    line breaks as separate chunks.
+    """
+    text = _generate_with_eos_suppress(prompt, max_tokens, temperature, top_p)
+
+    # Split preserving newlines: each line break becomes its own chunk
+    parts = []
+    for paragraph in text.split("\n"):
+        if paragraph:
+            words = paragraph.split(" ")
+            for i, word in enumerate(words):
+                parts.append(word if i == 0 else " " + word)
+        parts.append("\n")  # Preserve line breaks
+    # Remove trailing newline if the original didn't end with one
+    if parts and parts[-1] == "\n" and not text.endswith("\n"):
+        parts.pop()
+    # Also remove leading newline if empty first paragraph
+    if parts and parts[0] == "\n":
+        parts.pop(0)
+
+    for part in parts:
+        yield part
 
 
 def _generate_full(prompt: str, max_tokens: int, temperature: float, top_p: float) -> str:
-    """Generate full response (non-streaming)."""
-    sampler = make_sampler(temp=temperature, top_p=top_p)
-    return generate(_model, _tokenizer, prompt=prompt, max_tokens=max_tokens,
-                    sampler=sampler, verbose=False)
+    """Generate full response (non-streaming) with EOS suppression."""
+    return _generate_with_eos_suppress(prompt, max_tokens, temperature, top_p)
 
 
 def _chat_completion_stream(body: dict):
