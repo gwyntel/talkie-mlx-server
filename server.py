@@ -14,20 +14,41 @@ Endpoints:
 
 Usage:
     python server.py [--model-dir ./models/talkie-1930-13b-it-mlx-8bit] [--port 8080] [--host 127.0.0.1]
+
+DEBUG LOGGING:
+    Set LOG_LEVEL=DEBUG env var or --log-level flag for verbose request/response logging.
+    Logs to stderr by default; redirect to file via your launcher (launchd, systemd, etc).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
+import sys
 import time
+import traceback
 import uuid
+from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 from mlx_lm import load, generate
 from mlx_lm.sample_utils import make_sampler
 import mlx.core as mx
+
+# ---------------------------------------------------------------------------
+# Logging setup — configured before anything else so all paths log
+# ---------------------------------------------------------------------------
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    stream=sys.stderr,
+)
+logger = logging.getLogger("talkie-server")
+REQUEST_LOG = logging.getLogger("talkie-server.requests")
 
 # ---------------------------------------------------------------------------
 # Globals (set in main())
@@ -41,19 +62,10 @@ MAX_TOKENS_DEFAULT = 1024
 TEMPERATURE_DEFAULT = 0.7
 TOP_P_DEFAULT = 0.95
 
-
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _make_id(prefix="chatcmpl") -> str:
-    return f"{prefix}-{uuid.uuid4().hex[:12]}"
-
-
-# ---------------------------------------------------------------------------
-# EOS suppression: Talkie IT tends to emit <|end|> (token 65536) after just
-# 1-2 sentences, truncating responses. We bias down EOS logits for the first
-# MIN_RESPONSE_TOKENS tokens so the model naturally writes longer replies.
+# EOS suppression: Talkie IT tends to emit <|end|> (token 65536) after
+# just 1-2 sentences, truncating responses. We bias down EOS logits for
+# the first MIN_RESPONSE_TOKENS tokens so the model writes longer replies.
 # ---------------------------------------------------------------------------
 _EOS_IDS = {65535, 65536, 65537, 65539}
 _EOS_BIAS = -100.0
@@ -63,8 +75,10 @@ _MIN_RESPONSE_TOKENS = 80
 def _make_eos_processor():
     """Return a logits processor that suppresses EOS tokens for the first
     _MIN_RESPONSE_TOKENS generated tokens. Uses a closure to track count.
+
+    Each call returns a FRESH processor (don't reuse across requests).
     """
-    count = [0]  # mutable via closure
+    count = [0]
 
     def processor(tokens: mx.array, logits: mx.array) -> mx.array:
         count[0] += 1
@@ -80,41 +94,46 @@ def _generate_with_eos_suppress(prompt: str, max_tokens: int,
                                  temperature: float, top_p: float) -> str:
     """Generate with EOS suppression via logits_processors.
 
-    Talkie IT emits <|end|> prematurely (after 10-20 tokens of output),
-    producing very short 1-2 sentence responses. By biasing the EOS token
-    logits down by -100 for the first 80 tokens, the model naturally produces
-    multi-sentence, multi-paragraph Edwardian prose.
+    Uses mlx_lm.generate() which handles prefix-caching, KV cache,
+    and speculative decoding correctly — unlike a hand-rolled loop.
     """
     sampler = make_sampler(temp=temperature, top_p=top_p)
     processor = _make_eos_processor()
-    return generate(_model, _tokenizer, prompt=prompt, max_tokens=max_tokens,
-                    sampler=sampler, logits_processors=[processor], verbose=False)
+    t0 = time.perf_counter()
+    result = generate(_model, _tokenizer, prompt=prompt, max_tokens=max_tokens,
+                      sampler=sampler, logits_processors=[processor], verbose=False)
+    elapsed = time.perf_counter() - t0
+    gen_len = len(result)
+    logger.info(
+        f"[GENERATE] {elapsed:.2f}s, {gen_len} chars, "
+        f"max_tokens={max_tokens}, temp={temperature}, top_p={top_p}, "
+        f"prompt[:80]={repr(prompt[:80])}"
+    )
+    REQUEST_LOG.debug(f"[GENERATE] full_output={repr(result)}")
+    return result
 
 
 def _generate_tokens(prompt: str, max_tokens: int, temperature: float, top_p: float):
     """Generate full response, then yield it word-by-word for SSE streaming.
 
-    Uses EOS suppression to get longer responses from Talkie IT.
-    Newlines are preserved by splitting on word boundaries while keeping
-    line breaks as separate chunks.
+    Yields strings (words or \n) that should be concatenated to reconstruct
+    the original generated text character-for-character.
     """
     text = _generate_with_eos_suppress(prompt, max_tokens, temperature, top_p)
+    logger.info(f"[STREAM] generated {len(text)} chars, will yield ~{text.count(' ') + text.count(chr(10))} chunks")
 
-    # Split preserving newlines: each line break becomes its own chunk
+    # Split preserving newlines so Discord sees paragraph breaks too
     parts = []
-    for paragraph in text.split("\n"):
-        if paragraph:
-            words = paragraph.split(" ")
-            for i, word in enumerate(words):
-                parts.append(word if i == 0 else " " + word)
-        parts.append("\n")  # Preserve line breaks
-    # Remove trailing newline if the original didn't end with one
-    if parts and parts[-1] == "\n" and not text.endswith("\n"):
-        parts.pop()
-    # Also remove leading newline if empty first paragraph
-    if parts and parts[0] == "\n":
-        parts.pop(0)
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if line:
+            words = line.split(" ")
+            for j, word in enumerate(words):
+                parts.append(word if j == 0 else " " + word)
+        if i < len(lines) - 1:
+            parts.append("\n")
 
+    REQUEST_LOG.debug(f"[STREAM] chunks={parts}")
     for part in parts:
         yield part
 
@@ -124,27 +143,71 @@ def _generate_full(prompt: str, max_tokens: int, temperature: float, top_p: floa
     return _generate_with_eos_suppress(prompt, max_tokens, temperature, top_p)
 
 
+# ---------------------------------------------------------------------------
+# OpenAI-compatible response builders
+# ---------------------------------------------------------------------------
+
+def _make_id(prefix="chatcmpl") -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
 def _chat_completion_stream(body: dict):
-    """Yield SSE chunks for a chat completion request."""
+    """Yield SSE chunks for a chat completion request.
+
+    CRITICAL FIX: previously called generate() directly without EOS
+    suppression, so streaming responses were truncated to 1-2 sentences
+    while non-streaming was fine. Now uses _generate_with_eos_suppress
+    consistently.
+    """
+    req_id = _make_id()
     messages_raw = body.get("messages", [])
     max_tokens = body.get("max_tokens", MAX_TOKENS_DEFAULT)
     temperature = body.get("temperature", TEMPERATURE_DEFAULT)
     top_p = body.get("top_p", TOP_P_DEFAULT)
-    completion_id = _make_id()
 
     prompt = _tokenizer.apply_chat_template(messages_raw, tokenize=False)
+    prompt_tokens = len(_tokenizer.encode(prompt))
 
-    # Generate full text, then stream it word-by-word
-    sampler = make_sampler(temp=temperature, top_p=top_p)
-    full_text = generate(_model, _tokenizer, prompt=prompt, max_tokens=max_tokens,
-                         sampler=sampler, verbose=False)
+    REQUEST_LOG.debug(
+        f"[CHAT_STREAM] req_id={req_id} prompt_tokens={prompt_tokens} "
+        f"max_tokens={max_tokens} temp={temperature} top_p={top_p} "
+        f"messages={json.dumps(messages_raw, ensure_ascii=False)[:500]}"
+    )
+    REQUEST_LOG.info(
+        f"[CHAT_STREAM] req_id={req_id} starting generation "
+        f"prompt_tokens={prompt_tokens} max_tokens={max_tokens}"
+    )
 
-    # Stream tokens in chunks (word by word for readability)
-    words = full_text.split(' ')
-    for i, word in enumerate(words):
-        token_text = word if i == 0 else ' ' + word
+    try:
+        full_text = _generate_with_eos_suppress(prompt, max_tokens, temperature, top_p)
+    except Exception:
+        logger.exception(f"[CHAT_STREAM] req_id={req_id} generation FAILED")
+        REQUEST_LOG.error(f"[CHAT_STREAM] req_id={req_id} generation FAILED: {traceback.format_exc()}")
+        raise
+
+    REQUEST_LOG.info(
+        f"[CHAT_STREAM] req_id={req_id} generation done, "
+        f"output_len={len(full_text)} output[:120]={repr(full_text[:120])}"
+    )
+    REQUEST_LOG.debug(f"[CHAT_STREAM] req_id={req_id} FULL_OUTPUT={repr(full_text)}")
+
+    # Stream word-by-word
+    parts = []
+    lines = full_text.split("\n")
+    for i, line in enumerate(lines):
+        if line:
+            words = line.split(" ")
+            for j, word in enumerate(words):
+                parts.append(word if j == 0 else " " + word)
+        if i < len(lines) - 1:
+            parts.append("\n")
+
+    chunks_sent = 0
+    chars_sent = 0
+    for part in parts:
+        token_text = part
         chunk = {
-            "id": completion_id,
+            "id": req_id,
             "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": _model_id,
@@ -154,11 +217,14 @@ def _chat_completion_stream(body: dict):
                 "finish_reason": None,
             }],
         }
-        yield f"data: {json.dumps(chunk)}\n\n"
+        chunk_str = f"data: {json.dumps(chunk)}\n\n"
+        yield chunk_str
+        chunks_sent += 1
+        chars_sent += len(token_text)
 
-    # Final chunk with finish_reason
+    # Final chunk
     final = {
-        "id": completion_id,
+        "id": req_id,
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": _model_id,
@@ -171,18 +237,40 @@ def _chat_completion_stream(body: dict):
     yield f"data: {json.dumps(final)}\n\n"
     yield "data: [DONE]\n\n"
 
+    REQUEST_LOG.info(
+        f"[CHAT_STREAM] req_id={req_id} DONE chunks_sent={chunks_sent} "
+        f"chars_sent={chars_sent} total_output={len(full_text)}"
+    )
+
 
 def _chat_completion(body: dict) -> dict:
+    req_id = _make_id()
     messages_raw = body.get("messages", [])
     max_tokens = body.get("max_tokens", MAX_TOKENS_DEFAULT)
     temperature = body.get("temperature", TEMPERATURE_DEFAULT)
     top_p = body.get("top_p", TOP_P_DEFAULT)
 
     prompt = _tokenizer.apply_chat_template(messages_raw, tokenize=False)
-    text = _generate_full(prompt, max_tokens, temperature, top_p)
+
+    REQUEST_LOG.debug(
+        f"[CHAT] req_id={req_id} max_tokens={max_tokens} temp={temperature} "
+        f"messages={json.dumps(messages_raw, ensure_ascii=False)[:500]}"
+    )
+
+    try:
+        text = _generate_full(prompt, max_tokens, temperature, top_p)
+    except Exception:
+        logger.exception(f"[CHAT] req_id={req_id} generation FAILED")
+        raise
+
+    REQUEST_LOG.info(
+        f"[CHAT] req_id={req_id} output_len={len(text)} "
+        f"output[:200]={repr(text[:200])}"
+    )
+    REQUEST_LOG.debug(f"[CHAT] req_id={req_id} FULL_OUTPUT={repr(text)}")
 
     return {
-        "id": _make_id(),
+        "id": req_id,
         "object": "chat.completion",
         "created": int(time.time()),
         "model": _model_id,
@@ -194,8 +282,8 @@ def _chat_completion(body: dict) -> dict:
             }
         ],
         "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
+            "prompt_tokens": len(_tokenizer.encode(prompt)),
+            "completion_tokens": len(_tokenizer.encode(text)),
             "total_tokens": 0,
         },
     }
@@ -222,8 +310,8 @@ def _completion(body: dict) -> dict:
             }
         ],
         "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
+            "prompt_tokens": len(_tokenizer.encode(prompt)),
+            "completion_tokens": len(_tokenizer.encode(text)),
             "total_tokens": 0,
         },
     }
@@ -254,64 +342,116 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError) as e:
+            REQUEST_LOG.warning(f"[RESPONSE] client disconnected before JSON body: {e}")
 
     def _sse_response(self, generator):
-        """Stream SSE chunks from a generator."""
+        """Stream SSE chunks from a generator. Handle BrokenPipe gracefully."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
         self.end_headers()
-        for chunk in generator:
-            self.wfile.write(chunk.encode())
-            self.wfile.flush()
+        chunks_sent = 0
+        try:
+            for chunk in generator:
+                try:
+                    self.wfile.write(chunk.encode())
+                    self.wfile.flush()
+                    chunks_sent += 1
+                except (BrokenPipeError, ConnectionResetError) as e:
+                    REQUEST_LOG.warning(
+                        f"[SSE] client disconnected after {chunks_sent} chunks: {e}"
+                    )
+                    break
+        except Exception:
+            logger.exception(f"[SSE] generator raised exception after {chunks_sent} chunks")
+            raise
 
     def do_GET(self):
+        client = self.client_address[0] if self.client_address else "unknown"
+        REQUEST_LOG.info(f"[GET] {self.path} from {client}")
         if self.path in ("/v1/models", "/models"):
             self._json_response(200, _models())
         else:
             self._json_response(404, {"error": "not found"})
 
     def do_POST(self):
+        client = self.client_address[0] if self.client_address else "unknown"
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length)
         try:
             body = json.loads(raw)
         except json.JSONDecodeError:
+            REQUEST_LOG.warning(f"[POST] invalid JSON from {client}")
             self._json_response(400, {"error": "invalid JSON"})
             return
 
         t0 = time.time()
+        REQUEST_LOG.info(
+            f"[POST] {self.path} from {client} "
+            f"stream={body.get('stream', False)} "
+            f"max_tokens={body.get('max_tokens', MAX_TOKENS_DEFAULT)}"
+        )
+        REQUEST_LOG.debug(
+            f"[POST_BODY] {self.path} body={json.dumps(body, ensure_ascii=False)[:2000]}"
+        )
 
-        if self.path in ("/v1/chat/completions", "/chat/completions"):
-            stream = body.get("stream", False)
-            if stream:
-                self._sse_response(_chat_completion_stream(body))
+        try:
+            if self.path in ("/v1/chat/completions", "/chat/completions"):
+                stream = body.get("stream", False)
+                if stream:
+                    try:
+                        self._sse_response(_chat_completion_stream(body))
+                    except Exception:
+                        # SSE errors can't send a normal JSON error (headers already sent),
+                        # just log it and let the connection close.
+                        logger.exception("[POST] SSE stream failed")
+                        REQUEST_LOG.error(f"[POST] SSE stream failed: {traceback.format_exc()}")
+                    finally:
+                        elapsed = time.time() - t0
+                        mem = mx.get_peak_memory() / 1e9
+                        logger.info(
+                            f"[POST] chat/completions (stream) total_time={elapsed:.2f}s "
+                            f"peak_mem={mem:.1f}GB"
+                        )
+                else:
+                    result = _chat_completion(body)
+                    elapsed = time.time() - t0
+                    mem = mx.get_peak_memory() / 1e9
+                    n = len(result["choices"][0]["message"]["content"])
+                    logger.info(
+                        f"[POST] chat/completions time={elapsed:.2f}s chars={n} "
+                        f"peak_mem={mem:.1f}GB"
+                    )
+                    self._json_response(200, result)
+
+            elif self.path in ("/v1/completions", "/completions"):
+                result = _completion(body)
                 elapsed = time.time() - t0
+                n = len(result["choices"][0]["text"])
                 mem = mx.get_peak_memory() / 1e9
-                print(f"[talkie-server] chat/completions (stream) {elapsed:.1f}s, {mem:.1f} GB peak")
-            else:
-                result = _chat_completion(body)
-                elapsed = time.time() - t0
-                mem = mx.get_peak_memory() / 1e9
-                n = len(result["choices"][0]["message"]["content"])
-                print(f"[talkie-server] chat/completions {elapsed:.1f}s, {n} chars, {mem:.1f} GB peak")
+                logger.info(
+                    f"[POST] completions time={elapsed:.2f}s chars={n} "
+                    f"peak_mem={mem:.1f}GB"
+                )
                 self._json_response(200, result)
 
-        elif self.path in ("/v1/completions", "/completions"):
-            result = _completion(body)
-            elapsed = time.time() - t0
-            n = len(result["choices"][0]["text"])
-            mem = mx.get_peak_memory() / 1e9
-            print(f"[talkie-server] completions {elapsed:.1f}s, {n} chars, {mem:.1f} GB peak")
-            self._json_response(200, result)
+            else:
+                REQUEST_LOG.warning(f"[POST] unknown path {self.path}")
+                self._json_response(404, {"error": "not found"})
 
-        else:
-            self._json_response(404, {"error": "not found"})
+        except Exception:
+            logger.exception(f"[POST] UNHANDLED EXCEPTION on {self.path}")
+            REQUEST_LOG.error(
+                f"[POST] UNHANDLED EXCEPTION on {self.path}: {traceback.format_exc()}"
+            )
+            self._json_response(500, {"error": "internal server error"})
 
     def log_message(self, fmt, *args):
-        pass  # suppress default logging
+        pass  # we use our own logging
 
 
 # ---------------------------------------------------------------------------
@@ -331,31 +471,42 @@ def main():
                         help="Model identifier returned by the API")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--log-level", choices=["DEBUG","INFO","WARNING","ERROR"],
+                        default=os.environ.get("LOG_LEVEL", "INFO").upper(),
+                        help="Logging level (also set via LOG_LEVEL env var)")
     args = parser.parse_args()
+
+    # Reconfigure logging level if flag differs from env
+    if args.log_level != LOG_LEVEL:
+        logging.getLogger("talkie-server").setLevel(getattr(logging, args.log_level))
+        logging.getLogger("talkie-server.requests").setLevel(getattr(logging, args.log_level))
 
     _model_dir = str(Path(args.model_dir).resolve())
     _model_id = args.model_id
 
-    print(f"[talkie-server] Loading model from {_model_dir} ...")
+    logger.info(f"Loading model from {_model_dir} ...")
+    logger.info(f"Log level: {args.log_level}")
     _model, _tokenizer = load(_model_dir)
-    print(f"[talkie-server] Loaded. Peak: {mx.get_peak_memory() / 1e9:.1f} GB")
-    print(f"[talkie-server] Context window: {_model.args.max_seq_len} tokens")
+    logger.info(f"Loaded. Peak: {mx.get_peak_memory() / 1e9:.1f} GB")
+    logger.info(f"Context window: {_model.args.max_seq_len} tokens")
+    logger.info(f"EOS token ids: {_tokenizer.eos_token_ids}")
+    logger.info(f"EOS bias: {_EOS_BIAS} for first {_MIN_RESPONSE_TOKENS} tokens")
 
     # Detect quantization
     for name, mod in _model.named_modules():
         if "QuantizedLinear" in type(mod).__name__:
-            print(f"[talkie-server] Quantization: {mod.bits}-bit (group_size={mod.group_size}, mode={mod.mode})")
+            logger.info(f"Quantization: {mod.bits}-bit (group_size={mod.group_size}, mode={mod.mode})")
             break
     else:
-        print("[talkie-server] Quantization: none (BF16/F16)")
+        logger.info("Quantization: none (BF16/F16)")
 
-    print(f"[talkie-server] SSE streaming: enabled")
-    print(f"[talkie-server] Serving on http://{args.host}:{args.port}")
+    logger.info(f"SSE streaming: enabled")
+    logger.info(f"Serving on http://{args.host}:{args.port}")
     server = HTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[talkie-server] Shutting down.")
+        logger.info("Shutting down.")
         server.server_close()
 
 

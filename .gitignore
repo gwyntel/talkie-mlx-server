@@ -1,6 +1,10 @@
-__pycache__/
-*.pyc
-models/
-*.safetensors
-.DS_Store
+# Secrets and local config
+config.yaml
+*.env
 .env
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
