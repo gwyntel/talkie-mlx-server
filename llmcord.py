@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime
 import logging
+import re
+import time
 from typing import Any, Literal, Optional
 
 import discord
@@ -29,6 +31,14 @@ EDIT_DELAY_SECONDS = 1
 
 MAX_MESSAGE_NODES = 500
 
+# --- Era-format <-> Discord ping translator ---
+# Talkie sees "Correspondent No. 123456789:" but Discord pings with <@123456789>
+_CORRESPONDENT_PATTERN = re.compile(r"Correspondent No\.\s*(\d+)(:)")
+
+def era_to_discord(text: str) -> str:
+    """Convert era-appropriate 'Correspondent No. N:' back to Discord <@N> pings."""
+    return _CORRESPONDENT_PATTERN.sub(r"<@\1>:", text)
+
 
 def get_config(filename: str = "config.yaml") -> dict[str, Any]:
     with open(filename, encoding="utf-8") as file:
@@ -40,6 +50,11 @@ curr_model = next(iter(config["models"]))
 
 msg_nodes = {}
 last_task_time = 0
+
+# Per-channel/thread mutable context tracking
+# When a user runs /context open, subsequent messages in that channel can be pulled
+t_mutable_context = {}  # channel_id -> {opener_id, opened_at, ttl_seconds}
+MUTABLE_CONTEXT_TTL = 900  # 15 minutes
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -173,6 +188,27 @@ async def context_command(
         logging.info(f"[context clear] Purged {cleared} message nodes from cache (invoked by {interaction.user})")
         return
 
+    # ── /context reopen ───────────────────────────────────────────────
+    if action == "reopen":
+        if channel is None:
+            await interaction.response.send_message("⚠️ This can only be used in a channel or DM.", ephemeral=True)
+            return
+
+        t_mutable_context[channel.id] = dict(
+            opener_id=interaction.user.id,
+            opened_at=time.time(),
+            ttl_seconds=MUTABLE_CONTEXT_TTL
+        )
+        output = (
+            f"📂 **This conversation is now open for 15 minutes.**\n\n"
+            f"Any user who @-mentions the bot in this channel will be included in the context.\n\n"
+            f"Use `/context clear` to reset manually, or wait for the timer to expire."
+        )
+        embed = discord.Embed(description=output, color=discord.Color.green())
+        await interaction.response.send_message(embed=embed, ephemeral=False)
+        logging.info(f"[context reopen] Channel {channel.id} opened by {interaction.user.id} for {MUTABLE_CONTEXT_TTL}s")
+        return
+
     # ── /context show (default) ──────────────────────────────────────
     if channel is None:
         await interaction.response.send_message("⚠️ This can only be used in a channel or DM.", ephemeral=True)
@@ -298,6 +334,7 @@ async def context_autocomplete(interaction: discord.Interaction, curr_str: str) 
         ("show", "📌 Show context for this channel"),
         ("status", "📊 Bot status & server health"),
         ("clear", "🗑️ Clear message cache (fresh start)"),
+        ("reopen", "📂 Re-open this conversation for 15 min (allow others to @-mention)"),
     ]
     return [Choice(name=label, value=value) for value, label in options if curr_str.lower() in value or curr_str.lower() in label.lower()]
 
@@ -316,8 +353,35 @@ async def on_message(new_msg: discord.Message) -> None:
 
     is_dm = new_msg.channel.type == discord.ChannelType.private
 
-    if (not is_dm and discord_bot.user not in new_msg.mentions) or new_msg.author.bot:
+    # ── Gating: when does the bot respond? ────────────────────────────
+    if new_msg.author.bot:
         return
+
+    # Always respond in DMs
+    should_respond = is_dm
+
+    # In guild channels: require @-mention OR reply to the bot
+    bot_mentioned = discord_bot.user in new_msg.mentions
+    is_reply_to_bot = bool(new_msg.reference and new_msg.reference.resolved and new_msg.reference.resolved.author == discord_bot.user)
+
+    if not is_dm and (bot_mentioned or is_reply_to_bot):
+        should_respond = True
+
+    # Mutable context: if no @-mention, check if someone ran /context reopen
+    if not should_respond and not is_dm:
+        mc = t_mutable_context.get(new_msg.channel.id)
+        if mc and (time.time() - mc["opened_at"]) < mc["ttl_seconds"]:
+            # Only respond if this message @-mentions the bot (others still need to ping)
+            if bot_mentioned:
+                should_respond = True
+        elif mc:
+            # Expired — clean up
+            del t_mutable_context[new_msg.channel.id]
+
+    if not should_respond:
+        return
+
+    # ── End gating ────────────────────────────────────────────────────
 
     role_ids = set(role.id for role in getattr(new_msg.author, "roles", ()))
     channel_ids = set(filter(None, (new_msg.channel.id, getattr(new_msg.channel, "parent_id", None), getattr(new_msg.channel, "category_id", None))))
@@ -511,7 +575,8 @@ async def on_message(new_msg: discord.Message) -> None:
                 if curr_content:
                     all_content_parts.append(curr_content)
 
-                new_content = prev_content if finish_reason == None else (prev_content + curr_content)
+                # FIX: accumulate correctly, not one-chunk lag
+                new_content = prev_content + curr_content
 
                 if response_contents == [] and new_content == "":
                     logging.debug(f"[CHUNK] skipping empty initial content")
@@ -533,7 +598,8 @@ async def on_message(new_msg: discord.Message) -> None:
                     is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
 
                     if start_next_msg or ready_to_edit or is_final_edit:
-                        embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
+                        display_text = era_to_discord(response_contents[-1])
+                        embed.description = display_text if is_final_edit else (display_text + STREAMING_INDICATOR)
                         embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
 
                         if start_next_msg:
@@ -546,7 +612,7 @@ async def on_message(new_msg: discord.Message) -> None:
 
             if use_plain_responses:
                 for content in response_contents:
-                    await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
+                    await reply_helper(view=LayoutView().add_item(TextDisplay(content=era_to_discord(content))))
 
     except Exception:
         logging.exception("Error while generating response")
