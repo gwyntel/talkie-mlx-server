@@ -522,23 +522,21 @@ async def on_message(new_msg: discord.Message) -> None:
 
         messages.append(dict(role="system", content=system_prompt))
 
-    # Generate and send response message(s) (can be multiple if response is long)
-    curr_content = finish_reason = None
+    # Generate and send response message(s) — NON-STREAMING for simplicity.
+    # The server already generates fully before returning; streaming just
+    # added complexity (lag bugs, duplication bugs, chunk reassembly).
     response_msgs = []
     response_contents = []
 
-    openai_kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
+    openai_kwargs = dict(model=model, messages=messages[::-1], stream=False, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
 
-    logging.info(f"[API_CALL] model={model} stream=True messages_count={len(messages[::-1])}")
+    logging.info(f"[API_CALL] model={model} stream=False messages_count={len(messages[::-1])}")
     logging.debug(f"[API_KWARGS] {json.dumps(openai_kwargs, default=str)[:3000]}")
 
-    chunk_counter = [0]  # mutable via closure
-    all_content_parts = []  # assemble EVERYTHING for comparison
+    use_plain_responses = config.get("use_plain_responses", False)
+    max_message_length = 4000 if use_plain_responses else (4096 - len(STREAMING_INDICATOR))
 
-    if use_plain_responses := config.get("use_plain_responses", False):
-        max_message_length = 4000
-    else:
-        max_message_length = 4096 - len(STREAMING_INDICATOR)
+    if not use_plain_responses:
         embed = discord.Embed.from_dict(dict(fields=[dict(name=warning, value="", inline=False) for warning in sorted(user_warnings)]))
 
     async def reply_helper(**reply_kwargs) -> None:
@@ -551,98 +549,44 @@ async def on_message(new_msg: discord.Message) -> None:
 
     try:
         async with new_msg.channel.typing():
-            async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
-                if finish_reason != None:
-                    break
+            response = await openai_client.chat.completions.create(**openai_kwargs)
 
-                choice = chunk.choices[0] if chunk.choices else None
-                if not choice:
-                    logging.debug(f"[CHUNK] no choice in chunk, skipping")
-                    continue
+        raw_text = response.choices[0].message.content or ""
+        finish_reason = response.choices[0].finish_reason
+        logging.info(f"[GENERATE] finish={finish_reason} raw_len={len(raw_text)}")
+        logging.debug(f"[GENERATE] raw_text[:500]={repr(raw_text[:500])}")
 
-                finish_reason = choice.finish_reason
-                chunk_counter[0] += 1
+        translated = era_to_discord(raw_text)
 
-                # In OpenAI SSE streaming, delta.content is the NEW text for this chunk only.
-                # Do NOT accumulate with prev_content — that causes duplication.
-                delta_content = choice.delta.content or ""
+        # Split into Discord-safe segments
+        while translated:
+            segment = translated[:max_message_length]
+            response_contents.append(segment)
+            translated = translated[max_message_length:]
 
-                # OBSESSIVE: log EVERY chunk content and state
-                logging.debug(
-                    f"[CHUNK #{chunk_counter[0]}] finish={finish_reason} "
-                    f"delta={repr(delta_content)}"
-                )
-                if delta_content:
-                    all_content_parts.append(delta_content)
-
-                if response_contents == [] and delta_content == "":
-                    logging.debug(f"[CHUNK] skipping empty initial content")
-                    continue
-
-                if start_next_msg := response_contents == [] or len(response_contents[-1] + delta_content) > max_message_length:
-                    response_contents.append("")
-                    logging.debug(f"[CHUNK] starting new msg segment, response_contents now {len(response_contents)} segments")
-
-                response_contents[-1] += delta_content
-                logging.debug(f"[CHUNK] response_contents[-1] now {len(response_contents[-1])} chars: {repr(response_contents[-1][-80:])}")
-
-                if not use_plain_responses:
-                    time_delta = datetime.now().timestamp() - last_task_time
-
-                    ready_to_edit = time_delta >= EDIT_DELAY_SECONDS
-                    msg_split_incoming = finish_reason == None and len(response_contents[-1] + delta_content) > max_message_length
-                    is_final_edit = finish_reason != None or msg_split_incoming
-                    is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
-
-                    if start_next_msg or ready_to_edit or is_final_edit:
-                        display_text = era_to_discord(response_contents[-1])
-                        embed.description = display_text if is_final_edit else (display_text + STREAMING_INDICATOR)
-                        embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
-
-                        if start_next_msg:
-                            await reply_helper(embed=embed, silent=True)
-                        else:
-                            await asyncio.sleep(EDIT_DELAY_SECONDS - time_delta)
-                            await response_msgs[-1].edit(embed=embed)
-
-                        last_task_time = datetime.now().timestamp()
-
+        # Send segments
+        for i, content in enumerate(response_contents):
+            is_last = (i == len(response_contents) - 1)
             if use_plain_responses:
-                for content in response_contents:
-                    await reply_helper(view=LayoutView().add_item(TextDisplay(content=era_to_discord(content))))
+                await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
+            else:
+                embed.description = content
+                embed.color = EMBED_COLOR_COMPLETE if is_last else EMBED_COLOR_INCOMPLETE
+                await reply_helper(embed=embed, silent=True if i > 0 else False)
 
     except Exception:
         logging.exception("Error while generating response")
-        logging.error(
-            f"[STREAM_ERROR] after {chunk_counter[0]} chunks, "
-            f"assembled {len(''.join(all_content_parts))} chars from parts, "
-            f"response_contents has {len(response_contents)} segments"
-        )
+        # Attempt to send a failure notice so the user isn't left hanging
+        try:
+            await new_msg.reply("⚠️ I'm afraid the telegraph lines are tangled. Please try again.", silent=True)
+        except Exception:
+            pass
+    else:
+        for response_msg in response_msgs:
+            msg_nodes[response_msg.id].text = "".join(response_contents)
+            msg_nodes[response_msg.id].lock.release()
 
-    # OBSESSIVE: final assembly logging
-    assembled_from_parts = "".join(all_content_parts)
-    assembled_from_segments = "".join(response_contents)
-    logging.info(
-        f"[STREAM_DONE] chunks={chunk_counter[0]} "
-        f"parts_assembled={len(assembled_from_parts)} "
-        f"segments_assembled={len(assembled_from_segments)} "
-        f"finish_reason={finish_reason}"
-    )
-    logging.debug(f"[STREAM_DONE] full_parts_text={repr(assembled_from_parts[:500])}")
-    logging.debug(f"[STREAM_DONE] full_segments_text={repr(assembled_from_segments[:500])}")
-    if assembled_from_parts != assembled_from_segments:
-        diff_positions = [i for i in range(min(len(assembled_from_parts), len(assembled_from_segments)))
-                         if assembled_from_parts[i] != assembled_from_segments[i]]
-        logging.warning(
-            f"[MISMATCH] parts ({len(assembled_from_parts)}) != segments ({len(assembled_from_segments)})! "
-            f"DiffPositions[:20]={diff_positions[:20]}"
-        )
-
-    for response_msg in response_msgs:
-        msg_nodes[response_msg.id].text = "".join(response_contents)
-        msg_nodes[response_msg.id].lock.release()
-
-    # Delete oldest MsgNodes (lowest message IDs) from the cache
+    # Delete oldest MsgNodes from the cache
     if (num_nodes := len(msg_nodes)) > MAX_MESSAGE_NODES:
         for msg_id in sorted(msg_nodes.keys())[: num_nodes - MAX_MESSAGE_NODES]:
             async with msg_nodes.setdefault(msg_id, MsgNode()).lock:
