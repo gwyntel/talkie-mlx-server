@@ -563,37 +563,34 @@ async def on_message(new_msg: discord.Message) -> None:
                 finish_reason = choice.finish_reason
                 chunk_counter[0] += 1
 
-                prev_content = curr_content or ""
-                curr_content = choice.delta.content or ""
-                
+                # In OpenAI SSE streaming, delta.content is the NEW text for this chunk only.
+                # Do NOT accumulate with prev_content — that causes duplication.
+                delta_content = choice.delta.content or ""
+
                 # OBSESSIVE: log EVERY chunk content and state
                 logging.debug(
                     f"[CHUNK #{chunk_counter[0]}] finish={finish_reason} "
-                    f"delta={repr(curr_content)} "
-                    f"prev_len={len(prev_content)}"
+                    f"delta={repr(delta_content)}"
                 )
-                if curr_content:
-                    all_content_parts.append(curr_content)
+                if delta_content:
+                    all_content_parts.append(delta_content)
 
-                # FIX: accumulate correctly, not one-chunk lag
-                new_content = prev_content + curr_content
-
-                if response_contents == [] and new_content == "":
+                if response_contents == [] and delta_content == "":
                     logging.debug(f"[CHUNK] skipping empty initial content")
                     continue
 
-                if start_next_msg := response_contents == [] or len(response_contents[-1] + new_content) > max_message_length:
+                if start_next_msg := response_contents == [] or len(response_contents[-1] + delta_content) > max_message_length:
                     response_contents.append("")
                     logging.debug(f"[CHUNK] starting new msg segment, response_contents now {len(response_contents)} segments")
 
-                response_contents[-1] += new_content
+                response_contents[-1] += delta_content
                 logging.debug(f"[CHUNK] response_contents[-1] now {len(response_contents[-1])} chars: {repr(response_contents[-1][-80:])}")
 
                 if not use_plain_responses:
                     time_delta = datetime.now().timestamp() - last_task_time
 
                     ready_to_edit = time_delta >= EDIT_DELAY_SECONDS
-                    msg_split_incoming = finish_reason == None and len(response_contents[-1] + curr_content) > max_message_length
+                    msg_split_incoming = finish_reason == None and len(response_contents[-1] + delta_content) > max_message_length
                     is_final_edit = finish_reason != None or msg_split_incoming
                     is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
 
