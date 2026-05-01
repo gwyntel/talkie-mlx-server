@@ -540,7 +540,7 @@ class Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 def main():
-    global _model, _tokenizer, _model_dir, _model_id
+    global _model, _tokenizer, _model_dir, _model_id, _trace_dir
 
     parser = argparse.ArgumentParser(description="Talkie 8-bit OpenAI-compatible server")
     parser.add_argument(
