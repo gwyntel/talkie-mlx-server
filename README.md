@@ -212,6 +212,10 @@ For the full guide to connecting Talkie to Discord via llmcord (including
 system prompts, launchd persistence, context tuning, and troubleshooting),
 see [DISCORD_GUIDE.md](DISCORD_GUIDE.md).
 
+Our setup uses a **lightly patched llmcord** with two enhancements beyond upstream:
+- **`/context` command** — inspect, clear, or show bot status (see guide)
+- **`/model` autocomplete** — switch models via Discord slash command
+
 ## Credits
 
 - **Talkie model**: Alec Radford, Nick Levine, David Duvenaud -- [talkie-lm.com](https://talkie-lm.com)
