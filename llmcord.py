@@ -1,5 +1,6 @@
 import asyncio
 from base64 import b64encode
+from collections import deque
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -56,12 +57,74 @@ last_task_time = 0
 t_mutable_context = {}  # channel_id -> {opener_id, opened_at, ttl_seconds}
 MUTABLE_CONTEXT_TTL = 900  # 15 minutes
 
+# ── Token output tracking + uptime (for dynamic bot status) ──────────────
+_bot_start_time = time.time()
+_output_log: deque = deque()  # (timestamp, estimated_token_count) — pruned every update
+_STATUS_UPDATE_INTERVAL = 60  # seconds between status updates
+_TOKEN_WINDOW_SECONDS = 6 * 3600  # rolling 6h window
+
 intents = discord.Intents.default()
 intents.message_content = True
 activity = discord.CustomActivity(name=(config.get("status_message") or "github.com/jakobdylanc/llmcord")[:128])
 discord_bot = commands.Bot(intents=intents, activity=activity, command_prefix=None)
 
 httpx_client = httpx.AsyncClient()
+
+
+# ── Dynamic status updater ────────────────────────────────────────────────
+def _format_uptime(seconds: float) -> str:
+    """Human-friendly uptime: '3h 22m', '47m', '2d 5h'."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h {m}m"
+    d, h = divmod(h, 24)
+    return f"{d}d {h}h"
+
+
+def _format_tokens(count: int) -> str:
+    """Compact token count: '1.2k', '12.4k', '142k'."""
+    if count < 1000:
+        return str(count)
+    elif count < 100_000:
+        return f"{count / 1000:.1f}k"
+    else:
+        return f"{count / 1000:.0f}k"
+
+
+def _build_status_text() -> str:
+    """Build the bot status string: '<base> · X.Xk tokens/6h · up Nh Nm'."""
+    base = config.get("status_message") or "Talking like it's 1929"
+    now = time.time()
+
+    # Prune old entries
+    while _output_log and (now - _output_log[0][0]) > _TOKEN_WINDOW_SECONDS:
+        _output_log.popleft()
+
+    total_tokens = sum(t[1] for t in _output_log)
+    uptime = _format_uptime(now - _bot_start_time)
+    token_str = _format_tokens(total_tokens)
+
+    status = f"{base} · {token_str} tok/6h · up {uptime}"
+    return status[:128]  # Discord limit
+
+
+async def _status_updater():
+    """Background task: update bot status every _STATUS_UPDATE_INTERVAL seconds."""
+    await discord_bot.wait_until_ready()
+    while not discord_bot.is_closed():
+        try:
+            text = _build_status_text()
+            activity = discord.CustomActivity(name=text)
+            await discord_bot.change_presence(activity=activity)
+        except Exception:
+            logging.exception("[status_updater] failed to update status")
+        await asyncio.sleep(_STATUS_UPDATE_INTERVAL)
 
 
 @dataclass
@@ -124,6 +187,12 @@ async def context_command(
         system_tokens_est = 200 if system_prompt_enabled else 0
         cached_nodes = len(msg_nodes)
         max_nodes = MAX_MESSAGE_NODES
+        uptime = _format_uptime(time.time() - _bot_start_time)
+
+        # Count tokens in 6h window
+        now_ts = time.time()
+        recent_tokens = sum(t[1] for t in _output_log if now_ts - t[0] < _TOKEN_WINDOW_SECONDS)
+        tok_str = _format_tokens(recent_tokens)
 
         lines = [
             f"**📊 Bot Status**\n",
@@ -138,6 +207,7 @@ async def context_command(
             f"Max images:        {config.get('max_images', 0)}\n"
             f"Plain responses:   {'✅' if config.get('use_plain_responses', False) else '❌'}\n"
             f"```",
+            f"⏱️ Uptime: **{uptime}** — Output: **{tok_str} tokens** in last 6h",
         ]
 
         # Check if Talkie server is reachable
@@ -346,6 +416,11 @@ async def on_ready() -> None:
 
     await discord_bot.tree.sync()
 
+    # Start the dynamic status updater (idempotent — only starts once)
+    if not any(t.get_name() == "status_updater" for t in asyncio.all_tasks()):
+        asyncio.create_task(_status_updater(), name="status_updater")
+        logging.info("[status_updater] background task started")
+
 
 @discord_bot.event
 async def on_message(new_msg: discord.Message) -> None:
@@ -508,6 +583,110 @@ async def on_message(new_msg: discord.Message) -> None:
 
             curr_msg = curr_node.parent_msg
 
+    # ── Auto multi-user context merging (reply-graph stitching) ──────────
+    # When Person B replies to Person A's message (not a bot message), the
+    # chain walk goes: B → A → ... but misses the bot's RESPONSE to A,
+    # because A's parent isn't the bot message (the bot replied TO A).
+    #
+    # We fix this by scanning for "orphan" bot replies: messages in the
+    # channel where the bot replied to a user message that's IN our chain
+    # but whose bot response is NOT. We then thread those branches in.
+    #
+    # This lets separate user→bot conversations merge automatically when
+    # users interact with each other's messages, without forcing all
+    # conversations into one shared pool.
+    chain_msg_ids: set[int] = set()  # discord message IDs in our walked chain
+    if not is_dm:
+        # Reconstruct which message IDs we walked (via msg_nodes cache).
+        # We do this by re-walking the parent chain from new_msg and
+        # collecting every message ID we find in msg_nodes.
+        _walk = new_msg
+        _walked_ids = set()
+        while _walk is not None and len(_walked_ids) < max_messages:
+            _walked_ids.add(_walk.id)
+            _n = msg_nodes.get(_walk.id)
+            _walk = _n.parent_msg if _n else None
+        chain_msg_ids = _walked_ids
+
+        # Find bot replies that respond to messages IN our chain but
+        # whose response is NOT in our chain. These are orphan branches.
+        if len(messages) < max_messages:
+            # Check recent channel messages for bot replies to our chain
+            _merge_items = []  # (bot_msg_id, text, role) — ordered by time
+            try:
+                async for hist_msg in new_msg.channel.history(limit=50, before=new_msg):
+                    if len(messages) + len(_merge_items) >= max_messages:
+                        break
+                    # Is this a bot reply to a message in our chain?
+                    if hist_msg.author != discord_bot.user:
+                        continue
+                    if not hist_msg.reference or not hist_msg.reference.message_id:
+                        continue
+                    # The bot is replying to this message_id — is it in our chain?
+                    replied_to_id = hist_msg.reference.message_id
+                    if replied_to_id not in chain_msg_ids:
+                        continue
+                    # Is the bot's reply itself already in our chain?
+                    if hist_msg.id in chain_msg_ids:
+                        continue
+                    # Found an orphan bot reply! Get its cached text.
+                    bot_node = msg_nodes.get(hist_msg.id)
+                    if bot_node and bot_node.text:
+                        _merge_items.append((hist_msg, bot_node.text, "assistant"))
+                    else:
+                        # Not in cache — build from history content
+                        _text = hist_msg.content[:max_text] if hist_msg.content else ""
+                        if _text:
+                            _merge_items.append((hist_msg, _text, "assistant"))
+            except (discord.Forbidden, discord.HTTPException):
+                logging.debug("[AUTO_MERGE] could not read channel history for orphan detection")
+
+            # Also check for user messages that REPLY to a bot message in our chain
+            # but whose bot-response is in a different branch
+            try:
+                async for hist_msg in new_msg.channel.history(limit=50, before=new_msg):
+                    if len(messages) + len(_merge_items) >= max_messages:
+                        break
+                    if hist_msg.author == discord_bot.user:
+                        continue
+                    if hist_msg.id in chain_msg_ids:
+                        continue
+                    if not hist_msg.reference or not hist_msg.reference.message_id:
+                        continue
+                    replied_to_id = hist_msg.reference.message_id
+                    # Is this user replying to a bot message that's in our chain?
+                    if replied_to_id not in chain_msg_ids:
+                        continue
+                    # The replied-to message must be from the bot
+                    replied_msg = hist_msg.reference.cached_message or await new_msg.channel.fetch_message(replied_to_id)
+                    if replied_msg.author != discord_bot.user:
+                        continue
+                    # This user is joining the conversation by replying to the bot
+                    _text = hist_msg.content[:max_text] if hist_msg.content else ""
+                    _text = _text.removeprefix(discord_bot.user.mention).lstrip()
+                    _text = f"Correspondent No. {hist_msg.author.id}: {_text}"
+                    _merge_items.append((hist_msg, _text, "user"))
+            except (discord.Forbidden, discord.HTTPException):
+                logging.debug("[AUTO_MERGE] could not read channel history for cross-branch users")
+
+            if _merge_items:
+                # Dedup by message ID (our main chain scanned from the bottom up,
+                # history scanned newest-first — so we reverse to get chronological)
+                _seen = set(chain_msg_ids)
+                _added = []
+                for hist_msg, text, role in reversed(_merge_items):
+                    if hist_msg.id in _seen:
+                        continue
+                    _seen.add(hist_msg.id)
+                    _added.append(dict(content=text, role=role))
+
+                if _added:
+                    messages = _added + messages  # prepend chronologically
+                    logging.info(
+                        f"[AUTO_MERGE] stitched {len(_added)} orphan messages "
+                        f"into context (total now {len(messages)})"
+                    )
+
     logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
     # OBSESSIVE: log the entire message chain that was built
     logging.debug(f"[MSG_CHAIN] {len(messages)} messages traced; reversed for API:")
@@ -555,6 +734,14 @@ async def on_message(new_msg: discord.Message) -> None:
         finish_reason = response.choices[0].finish_reason
         logging.info(f"[GENERATE] finish={finish_reason} raw_len={len(raw_text)}")
         logging.debug(f"[GENERATE] raw_text[:500]={repr(raw_text[:500])}")
+
+        # ── Record token output for status display ──────────────────────
+        # Use usage.completion_tokens if available, else estimate ~4 chars/token
+        if hasattr(response, 'usage') and response.usage and response.usage.completion_tokens:
+            est_tokens = response.usage.completion_tokens
+        else:
+            est_tokens = max(1, len(raw_text) // 4)
+        _output_log.append((time.time(), est_tokens))
 
         translated = era_to_discord(raw_text)
 

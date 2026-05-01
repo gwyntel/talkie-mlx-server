@@ -58,7 +58,7 @@ _tokenizer = None
 _model_dir = None
 _model_id = "talkie-1930-13b-it-mlx-8bit"
 
-MAX_TOKENS_DEFAULT = 1024
+MAX_TOKENS_DEFAULT=1024
 TEMPERATURE_DEFAULT = 0.7
 TOP_P_DEFAULT = 0.95
 
@@ -69,7 +69,7 @@ TOP_P_DEFAULT = 0.95
 # ---------------------------------------------------------------------------
 _EOS_IDS = {65535, 65536, 65537, 65539}
 _EOS_BIAS = -100.0
-_MIN_RESPONSE_TOKENS = 80
+_MIN_RESPONSE_TOKENS=80
 
 
 def _make_eos_processor():
