@@ -32,6 +32,69 @@ EDIT_DELAY_SECONDS = 1
 
 MAX_MESSAGE_NODES = 500
 
+# --- Vision proxy: describe images via a local VLM in Edwardian voice ---
+# When enabled, image attachments are sent to a separate vision model which
+# describes them in period-appropriate language. The description is then
+# injected into the text message so the text-only Talkie model can "see".
+
+VISION_PROXY_SYSTEM = (
+    "You are describing a photograph for a person living in the year 1929. "
+    "Describe ONLY what is visible in the image using the language and "
+    "vocabulary of an educated Edwardian gentleman. Refer to modern objects "
+    "using the nearest equivalent from your era (e.g. 'motor-car' not 'car', "
+    "'wireless set' not 'radio', 'aeroplane' not 'plane'). Do not mention "
+    "anything that could not exist in 1929. Be specific and vivid but concise "
+    "(2-4 sentences). Do not preface with 'I see' or 'This shows' — simply "
+    "describe."
+)
+
+
+async def _describe_image_via_vision_proxy(
+    b64_image: str,
+    content_type: str,
+    vision_url: str,
+    vision_model: str,
+    httpx_client: httpx.AsyncClient,
+) -> str | None:
+    """Send an image to a local VLM and get an Edwardian-era description."""
+    try:
+        import logging as _log
+        _logger = _log.getLogger("vision_proxy")
+        data_url = f"data:{content_type};base64,{b64_image}"
+        payload = {
+            "model": vision_model,
+            "messages": [
+                {"role": "system", "content": VISION_PROXY_SYSTEM},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this photograph."},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                },
+            ],
+            "max_tokens": 150,
+            "temperature": 0.4,
+            "stream": False,
+        }
+        resp = await httpx_client.post(
+            f"{vision_url}/chat/completions",
+            json=payload,
+            timeout=30.0,
+        )
+        if resp.status_code == 200:
+            body = resp.json()
+            desc = body["choices"][0]["message"]["content"].strip()
+            _logger.info(f"[VISION_PROXY] Image described: {desc[:80]}...")
+            return desc
+        else:
+            _logger.warning(f"[VISION_PROXY] VLM returned {resp.status_code}: {resp.text[:200]}")
+            return None
+    except Exception:
+        import logging as _log
+        _log.getLogger("vision_proxy").exception("[VISION_PROXY] Failed to describe image")
+        return None
+
 # --- Era-format <-> Discord ping translator ---
 # Talkie sees "Correspondent No. 123456789:" but Discord pings with <@123456789>
 _CORRESPONDENT_PATTERN = re.compile(r"Correspondent No\.\s*(\d+)(:)")
@@ -530,11 +593,43 @@ async def on_message(new_msg: discord.Message) -> None:
                     + [resp.text for att, resp in zip(good_attachments, attachment_responses) if att.content_type.startswith("text")]
                 )
 
-                curr_node.images = [
-                    dict(type="image_url", image_url=dict(url=f"data:{att.content_type};base64,{b64encode(resp.content).decode('utf-8')}"))
+                curr_node.images = []
+
+                # --- Vision proxy: describe images instead of passing raw pixels ---
+                image_attachments = [
+                    (att, resp)
                     for att, resp in zip(good_attachments, attachment_responses)
                     if att.content_type.startswith("image")
                 ]
+
+                vision_proxy = config.get("vision_proxy")
+                if image_attachments and vision_proxy and vision_proxy.get("enabled"):
+                    vp_url = vision_proxy["base_url"].rstrip("/") + "/v1"
+                    vp_model = vision_proxy["model"]
+                    vp_descs = await asyncio.gather(*[
+                        _describe_image_via_vision_proxy(
+                            b64encode(resp.content).decode("utf-8"),
+                            att.content_type,
+                            vp_url,
+                            vp_model,
+                            httpx_client,
+                        )
+                        for att, resp in image_attachments
+                    ])
+                    photo_lines = []
+                    for desc in vp_descs:
+                        if desc:
+                            photo_lines.append(f"[The correspondent sends a photograph depicting: {desc}]")
+                        else:
+                            photo_lines.append("[The correspondent sends a photograph, but the wireless is too faint to make it out.]")
+                    if photo_lines:
+                        curr_node.text = (curr_node.text + "\n" + "\n".join(photo_lines)) if curr_node.text else "\n".join(photo_lines)
+                elif image_attachments:
+                    # No vision proxy — pass through as base64 (only works if model supports vision)
+                    curr_node.images = [
+                        dict(type="image_url", image_url=dict(url=f"data:{att.content_type};base64,{b64encode(resp.content).decode('utf-8')}"))
+                        for att, resp in image_attachments
+                    ]
 
                 if curr_node.role == "user" and (curr_node.text or curr_node.images):
                     curr_node.text = f"Correspondent No. {curr_msg.author.id}: {curr_node.text}"
