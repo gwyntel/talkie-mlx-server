@@ -287,6 +287,28 @@ async def context_command(
         except Exception:
             lines.append("🔌 Inference server: **offline** — bot will not be able to respond")
 
+        # Check vision proxy
+        vision_proxy = config.get("vision_proxy")
+        if vision_proxy and vision_proxy.get("enabled"):
+            vp_model = vision_proxy.get("model", "unknown")
+            vp_url = vision_proxy["base_url"].rstrip("/") + "/v1"
+            try:
+                import httpx as _hx
+                async with _hx.AsyncClient() as _c:
+                    _r = await _c.get(f"{vp_url}/models", timeout=5.0)
+                    if _r.status_code == 200:
+                        vlm_list = _r.json().get("data", [])
+                        vlm_model = vlm_list[0]["id"] if vlm_list else "unknown"
+                        # Friendly short name
+                        vlm_short = vlm_model.rsplit("/", 1)[-1] if "/" in vlm_model else vlm_model
+                        lines.append(f"👁️ Vision proxy: **online** (`{vlm_short}`)")
+                    else:
+                        lines.append(f"👁️ Vision proxy: ⚠️ responding with status {_r.status_code}")
+            except Exception:
+                lines.append("👁️ Vision proxy: **offline** — images will show as *\"wireless too faint\"*")
+        else:
+            lines.append("👁️ Vision proxy: ❌ disabled")
+
         embed = discord.Embed(description="\n".join(lines), color=discord.Color.blurple())
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
