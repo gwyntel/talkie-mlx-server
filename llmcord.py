@@ -273,15 +273,20 @@ async def context_command(
             f"⏱️ Uptime: **{uptime}** — Output: **{tok_str} tokens** in last 6h",
         ]
 
-        # Check if Talkie server is reachable
+        # Check if Talkie server is reachable (uses /v1/health for idle-eviction status)
         try:
             import httpx as _hx
+            _base = config["providers"][curr_model.split("/")[0]]["base_url"].rstrip("/")
             async with _hx.AsyncClient() as _c:
-                _r = await _c.get(config["providers"][curr_model.split("/")[0]]["base_url"].rstrip("/") + "/models", timeout=5.0)
+                _r = await _c.get(f"{_base}/health", timeout=5.0)
                 if _r.status_code == 200:
-                    model_list = _r.json().get("data", [])
-                    server_model = model_list[0]["id"] if model_list else "unknown"
-                    lines.append(f"🔌 Inference server: **online** (`{server_model}`)")
+                    health = _r.json()
+                    if health.get("model_loaded"):
+                        idle = health.get("idle_seconds", 0)
+                        idle_str = f" (idle {idle:.0f}s)" if idle > 60 else ""
+                        lines.append(f"🔌 Inference server: **online**{idle_str}")
+                    else:
+                        lines.append(f"🔌 Inference server: 💤 **sleeping** (model evicted, auto-reloads on next message)")
                 else:
                     lines.append(f"🔌 Inference server: ⚠️ responding with status {_r.status_code}")
         except Exception:

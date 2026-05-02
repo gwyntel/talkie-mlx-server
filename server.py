@@ -7,8 +7,16 @@ tiktoken tokenizer via TokenizerWrapper, and chat template rendering.
 
 Supports both streaming (SSE) and non-streaming responses.
 
+IDLE UNLOAD:
+    After --idle-timeout seconds with no requests, the model weights are
+    evicted from MLX memory (gc + mx.clear_cache). The server stays up,
+    and the next request triggers an automatic reload (NaN + heartbeat ping).
+    Configure timeout via --idle-timeout (default 600 = 10 min) or
+    IDLE_TIMEOUT env var. Set to 0 to disable.
+
 Endpoints:
     GET  /v1/models            - list models
+    GET  /v1/health            - health check (model loaded/unloaded status)
     POST /v1/chat/completions  - OpenAI chat format (streaming + non-streaming)
     POST /v1/completions       - raw text completion
 
@@ -30,10 +38,12 @@ TRACE LOGGING (for dataset building):
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import os
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -65,8 +75,14 @@ _tokenizer = None
 _model_dir = None
 _model_id = "talkie-1930-13b-it-mlx-8bit"
 _trace_dir = None  # set via --trace-dir or TRACE_DIR env
+_idle_timeout = 600  # seconds; 0 = disabled
 
-MAX_TOKENS_DEFAULT=1024
+# Idle-unload state
+_model_loaded = False          # True when _model/_tokenizer are populated
+_last_request_time = 0.0      # monotonic time of last completed request
+_reload_lock = threading.Lock()  # serialize load/unload
+
+MAX_TOKENS_DEFAULT = 1024
 TEMPERATURE_DEFAULT = 0.7
 TOP_P_DEFAULT = 0.95
 
@@ -77,7 +93,80 @@ TOP_P_DEFAULT = 0.95
 # ---------------------------------------------------------------------------
 _EOS_IDS = {65535, 65536, 65537, 65539}
 _EOS_BIAS = -100.0
-_MIN_RESPONSE_TOKENS=80
+_MIN_RESPONSE_TOKENS = 80
+
+
+# ---------------------------------------------------------------------------
+# Idle unload / lazy reload
+# ---------------------------------------------------------------------------
+def _ensure_model_loaded():
+    """Make sure the model is in memory. Reload if it was evicted.
+
+    Thread-safe: only one thread does the reload; others wait.
+    Returns True if a reload happened (for logging).
+    """
+    global _model, _tokenizer, _model_loaded
+
+    if _model_loaded and _model is not None:
+        return False
+
+    with _reload_lock:
+        # Double-check after acquiring lock
+        if _model_loaded and _model is not None:
+            return False
+
+        logger.info("[IDLE] Model not loaded — reloading...")
+        t0 = time.perf_counter()
+        _model, _tokenizer = load(_model_dir)
+        _model_loaded = True
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            f"[IDLE] Model reloaded in {elapsed:.1f}s. "
+            f"Peak: {mx.get_peak_memory() / 1e9:.1f} GB"
+        )
+        return True
+
+
+def _evict_model():
+    """Evict model weights from MLX memory.
+
+    Called by the idle watcher thread after _idle_timeout seconds of
+    inactivity.  Safe to call even if model is already evicted.
+    """
+    global _model, _tokenizer, _model_loaded
+
+    with _reload_lock:
+        if not _model_loaded:
+            return
+
+        logger.info("[IDLE] Evicting model from memory (idle timeout)...")
+        _model = None
+        _tokenizer = None  # tokenizer is small but clean up anyway
+        _model_loaded = False
+        gc.collect()
+        mx.clear_cache()
+        logger.info(
+            f"[IDLE] Model evicted. "
+            f"Peak after evict: {mx.get_peak_memory() / 1e9:.1f} GB"
+        )
+
+
+def _idle_watcher():
+    """Background thread: periodically check if the model should be evicted.
+
+    Runs every 30 seconds. If _idle_timeout > 0 and no request has completed
+    in that many seconds, calls _evict_model().
+    """
+    while True:
+        time.sleep(30)
+        if _idle_timeout <= 0:
+            continue  # idle unload disabled
+        if not _model_loaded:
+            continue  # already evicted, nothing to do
+
+        idle_seconds = time.monotonic() - _last_request_time
+        if idle_seconds >= _idle_timeout:
+            _evict_model()
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +285,6 @@ def _generate_tokens(prompt: str, max_tokens: int, temperature: float, top_p: fl
     REQUEST_LOG.debug(f"[STREAM] chunks={parts}")
     for part in parts:
         yield part
-
 
 def _generate_full(prompt: str, max_tokens: int, temperature: float, top_p: float) -> dict:
     """Generate full response (non-streaming) with EOS suppression.
@@ -369,7 +457,6 @@ def _chat_completion(body: dict) -> dict:
         },
     }
 
-
 def _completion(body: dict) -> dict:
     prompt = body.get("prompt", "")
     max_tokens = body.get("max_tokens", MAX_TOKENS_DEFAULT)
@@ -409,6 +496,17 @@ def _models() -> dict:
                 "owned_by": "talkie-lm",
             }
         ],
+    }
+
+
+def _health() -> dict:
+    """Health check: reports model loaded/unloaded status + idle time."""
+    idle_secs = time.monotonic() - _last_request_time if _model_loaded else 0
+    return {
+        "status": "ready" if _model_loaded else "sleeping",
+        "model_loaded": _model_loaded,
+        "idle_seconds": round(idle_secs, 1),
+        "idle_timeout": _idle_timeout,
     }
 
 
@@ -456,19 +554,28 @@ class Handler(BaseHTTPRequestHandler):
         REQUEST_LOG.info(f"[GET] {self.path} from {client}")
         if self.path in ("/v1/models", "/models"):
             self._json_response(200, _models())
+        elif self.path in ("/v1/health", "/health"):
+            self._json_response(200, _health())
         else:
             self._json_response(404, {"error": "not found"})
 
     def do_POST(self):
+        global _last_request_time
+
         client = self.client_address[0] if self.client_address else "unknown"
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length)
         try:
             body = json.loads(raw)
-        except json.JSONDecodeError:
+        except json.DecodeError:
             REQUEST_LOG.warning(f"[POST] invalid JSON from {client}")
             self._json_response(400, {"error": "invalid JSON"})
             return
+
+        # Ensure model is loaded (reload if evicted)
+        reloaded = _ensure_model_loaded()
+        if reloaded:
+            REQUEST_LOG.info("[POST] model was unloaded, reload completed before handling request")
 
         t0 = time.time()
         REQUEST_LOG.info(
@@ -531,6 +638,9 @@ class Handler(BaseHTTPRequestHandler):
             )
             self._json_response(500, {"error": "internal server error"})
 
+        # Mark last request time (even on error — we still served something)
+        _last_request_time = time.monotonic()
+
     def log_message(self, fmt, *args):
         pass  # we use our own logging
 
@@ -541,6 +651,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     global _model, _tokenizer, _model_dir, _model_id, _trace_dir
+    global _idle_timeout, _last_request_time, _model_loaded
 
     parser = argparse.ArgumentParser(description="Talkie 8-bit OpenAI-compatible server")
     parser.add_argument(
@@ -558,6 +669,12 @@ def main():
     parser.add_argument("--trace-dir", default=os.environ.get("TRACE_DIR", ""),
                         help="Directory to write trace JSONL files for dataset building "
                              "(also set via TRACE_DIR env var). Disabled by default.")
+    parser.add_argument("--idle-timeout",
+                        type=int,
+                        default=int(os.environ.get("IDLE_TIMEOUT", "600")),
+                        help="Seconds of inactivity before evicting model from memory. "
+                             "0 = never unload. Default: 600 (10 min). "
+                             "Also set via IDLE_TIMEOUT env var.")
     args = parser.parse_args()
 
     # Reconfigure logging level if flag differs from env
@@ -567,6 +684,7 @@ def main():
 
     _model_dir = str(Path(args.model_dir).resolve())
     _model_id = args.model_id
+    _idle_timeout = args.idle_timeout
 
     # Configure trace directory
     if args.trace_dir:
@@ -578,7 +696,12 @@ def main():
 
     logger.info(f"Loading model from {_model_dir} ...")
     logger.info(f"Log level: {args.log_level}")
+    logger.info(f"Idle timeout: {_idle_timeout}s ({'disabled' if _idle_timeout == 0 else f'{_idle_timeout // 60} min'})")
+
     _model, _tokenizer = load(_model_dir)
+    _model_loaded = True
+    _last_request_time = time.monotonic()
+
     logger.info(f"Loaded. Peak: {mx.get_peak_memory() / 1e9:.1f} GB")
     logger.info(f"Context window: {_model.args.max_seq_len} tokens")
     logger.info(f"EOS token ids: {_tokenizer.eos_token_ids}")
@@ -593,7 +716,14 @@ def main():
         logger.info("Quantization: none (BF16/F16)")
 
     logger.info(f"SSE streaming: enabled")
+    logger.info(f"Health endpoint: /v1/health")
     logger.info(f"Serving on http://{args.host}:{args.port}")
+
+    # Start idle watcher thread
+    watcher = threading.Thread(target=_idle_watcher, name="idle-watcher", daemon=True)
+    watcher.start()
+    logger.info("[IDLE] Watcher thread started (checks every 30s)")
+
     server = HTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
