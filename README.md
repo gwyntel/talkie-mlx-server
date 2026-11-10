@@ -1,3 +1,5 @@
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/gwyntel/talkie-mlx-server)
+
 # talkie-mlx-server
 
 OpenAI-compatible API server for the [Talkie 1930 13B IT](https://talkie-lm.com/introducing-talkie) model running on Apple MLX with 8-bit quantization.
